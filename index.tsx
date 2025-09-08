@@ -1,9 +1,12 @@
 
+
 import React, { useState, useEffect, useRef, FormEvent, FC, ReactNode, useCallback } from 'react';
 import { createRoot } from 'react-dom/client';
 import { GoogleGenAI, Content, Part, GenerateContentResponse, Chat, Modality, Type } from '@google/genai';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
+import remarkMath from 'remark-math';
+import rehypeMathjax from 'rehype-mathjax/browser';
 import { v4 as uuidv4 } from 'uuid';
 
 // Fix: Add types for the Web Speech API to resolve TypeScript errors.
@@ -39,16 +42,16 @@ declare global {
 
 
 // --- MODELS ---
-const HEAVY_MODEL = 'gemini-2.5-pro';
+const HEAVY_MODEL = 'gemini-2.5-flash';
 const PRO_MODEL = 'gemini-2.5-flash';
-const QUICK_MODEL = 'gemini-2.5-flash-lite';
+const QUICK_MODEL = 'gemini-2.5-flash';
 const IMAGE_MODEL = 'gemini-2.5-flash-image-preview'; // Used for both generation and editing
 const TITLE_GEN_MODEL = 'gemini-2.5-flash';
 
 // --- AGENT INSTRUCTIONS ---
 const INITIAL_SYSTEM_INSTRUCTION = "You are an expert-level AI assistant. Your task is to provide a comprehensive, accurate, and well-reasoned initial response to the user's query. Aim for clarity and depth. Note: Your response is an intermediate step for other AI agents and will not be shown to the user. Be concise and focus on core information without unnecessary verbosity.";
 const REFINEMENT_SYSTEM_INSTRUCTION = "You are a reflective AI agent. Your primary task is to find flaws. Critically analyze your previous response and the responses from other AI agents. Focus specifically on identifying factual inaccuracies, logical fallacies, omissions, or any other weaknesses. Your goal is to generate a new, revised response that corrects these specific errors and is free from the flaws you have identified. Note: This refined response is for a final synthesizer agent, not the user, so be direct and prioritize accuracy over conversational style.";
-const SYNTHESIZER_SYSTEM_INSTRUCTION = "You are a master synthesizer AI. Your PRIMARY GOAL is to write the final, complete response to the user's query. You will be given the user's query and four refined responses from other AI agents. Your task is to analyze these responses—identifying their strengths to incorporate and their flaws to discard. Use this analysis to construct the single best possible answer for the user. Do not just critique the other agents; your output should BE the final, polished response.";
+const SYNTHESIZER_SYSTEM_INSTRUCTION = "You are a master synthesizer AI. Your PRIMARY GOAL is to write the final, complete response to the user's query. You will be given the user's query and four refined responses from other AI agents. Your task is to analyze these responses—identifying their strengths to incorporate and their flaws to discard. Use this analysis to construct the single best possible answer for the user. Do not just critique the other agents; your output should BE the final, polished response. **IMPORTANT FORMATTING RULES:** For mathematical content, present it in the style of a research paper. Use headings and lists to structure your answer. For long equations or derivations, use display math formatting by placing the `\\[ ... \\]` delimiters on their own lines, separated by blank lines from the surrounding text. For inline math, use `\\( ... \\)`.";
 const TITLE_GEN_INSTRUCTION = "Generate a very short, concise title (5 words or less) for the following user query. Respond with only the title and nothing else.";
 
 // --- TYPES ---
@@ -93,6 +96,9 @@ interface ExecutionResult {
   output: ReactNode;
   isRunning: boolean;
 }
+
+// --- CONSTANTS ---
+const REFINEMENT_TRIGGER_PART: Part[] = [{ text: "Proceed with reflection and refinement based on your instructions and the conversation history." }];
 
 
 // --- ICONS (as components) ---
@@ -259,7 +265,7 @@ const CodeBlock: FC<{
 
 const ProgressRing: FC<{ progress: number }> = ({ progress }) => {
     const radius = 18;
-    const stroke = 3;
+    const stroke = 4; // Increased for visibility
     const normalizedRadius = radius - stroke;
     const circumference = normalizedRadius * 2 * Math.PI;
     const strokeDashoffset = circumference - (progress / 100) * circumference;
@@ -267,13 +273,20 @@ const ProgressRing: FC<{ progress: number }> = ({ progress }) => {
     return (
         <div className="progress-container">
             <svg height={radius * 2} width={radius * 2} className="progress-ring">
-                <circle stroke="#555" fill="transparent" strokeWidth={stroke} r={normalizedRadius} cx={radius} cy={radius} />
+                <circle
+                    stroke="rgba(255, 255, 255, 0.2)" // Lighter background
+                    fill="transparent"
+                    strokeWidth={stroke}
+                    r={normalizedRadius}
+                    cx={radius}
+                    cy={radius}
+                />
                 <circle
                   stroke="var(--accent-neon)"
                   fill="transparent"
                   strokeWidth={stroke}
                   strokeDasharray={`${circumference} ${circumference}`}
-                  style={{ strokeDashoffset }}
+                  style={{ strokeDashoffset, strokeLinecap: 'round' }} // Added round cap
                   r={normalizedRadius}
                   cx={radius}
                   cy={radius}
@@ -596,6 +609,11 @@ const App: FC = () => {
         userMessageParts.unshift({ text: input.trim() });
       }
 
+      // API call fails if parts array is empty
+      if (userMessageParts.length === 0) {
+        throw new Error("Cannot send an empty message.");
+      }
+
       const userMessage: Message = { id: uuidv4(), role: 'user', parts: userMessageParts };
       const thinkingMessage: Message = { id: thinkingMessageId, role: 'model', parts: [{ text: '...' }] };
   
@@ -687,6 +705,9 @@ const App: FC = () => {
 
         const runAgent = (agentInstruction: string, h: Content[], p: Part[]) => {
             const combinedInstruction = [userSystemInstruction, agentInstruction].filter(Boolean).join('\n\n---\n\n');
+            if (p.length === 0) { // Fix: Prevent calling API with empty parts
+              p.push({ text: "Continue." });
+            }
             return ai.models.generateContent({
                 model,
                 contents: [...h, { role: 'user', parts: p }],
@@ -708,14 +729,14 @@ const App: FC = () => {
         
                 setLoadingMessage('Agents 2 & 3: Refining...');
                 const [refinement1, refinement2] = await Promise.all([
-                    runAgent(REFINEMENT_SYSTEM_INSTRUCTION, refinedHistory, []),
-                    runAgent(REFINEMENT_SYSTEM_INSTRUCTION, refinedHistory, []),
+                    runAgent(REFINEMENT_SYSTEM_INSTRUCTION, refinedHistory, REFINEMENT_TRIGGER_PART),
+                    runAgent(REFINEMENT_SYSTEM_INSTRUCTION, refinedHistory, REFINEMENT_TRIGGER_PART),
                 ]);
         
                 setLoadingMessage('Agents 4 & 5: Refining...');
                 const [refinement3, refinement4] = await Promise.all([
-                    runAgent(REFINEMENT_SYSTEM_INSTRUCTION, refinedHistory, []),
-                    runAgent(REFINEMENT_SYSTEM_INSTRUCTION, refinedHistory, []),
+                    runAgent(REFINEMENT_SYSTEM_INSTRUCTION, refinedHistory, REFINEMENT_TRIGGER_PART),
+                    runAgent(REFINEMENT_SYSTEM_INSTRUCTION, refinedHistory, REFINEMENT_TRIGGER_PART),
                 ]);
                 const refinedParts = [
                     { text: "--- Refined Response 1 ---\n" }, ...(refinement1.candidates?.[0]?.content?.parts || []),
@@ -739,8 +760,8 @@ const App: FC = () => {
 
                 setLoadingMessage('Agents 2 & 3: Refining...');
                 const [refinement1, refinement2] = await Promise.all([
-                    runAgent(REFINEMENT_SYSTEM_INSTRUCTION, refinedHistory, []),
-                    runAgent(REFINEMENT_SYSTEM_INSTRUCTION, refinedHistory, []),
+                    runAgent(REFINEMENT_SYSTEM_INSTRUCTION, refinedHistory, REFINEMENT_TRIGGER_PART),
+                    runAgent(REFINEMENT_SYSTEM_INSTRUCTION, refinedHistory, REFINEMENT_TRIGGER_PART),
                 ]);
                 const refinedParts = [
                     { text: "--- Refined Response 1 ---\n" }, ...(refinement1.candidates?.[0]?.content?.parts || []),
@@ -1023,7 +1044,7 @@ const App: FC = () => {
 
   const renderMessagePart = (part: Part, message: Message, partIndex: number) => {
     if ('text' in part && part.text) {
-        return <MessageContentRenderer key={partIndex} part={part} message={message} />;
+        return <MessageContentRenderer key={`${message.id}-${partIndex}`} part={part} message={message} />;
     }
     if ('inlineData' in part && part.inlineData) {
       const { mimeType, data } = part.inlineData;
@@ -1035,29 +1056,42 @@ const App: FC = () => {
   };
 
   const MessageContentRenderer: FC<{ part: Part, message: Message }> = ({ part, message }) => {
-    const contentRef = useRef<HTMLDivElement>(null);
     const text = (part as any).text || '';
+    const containerRef = useRef<HTMLDivElement>(null);
 
-    // This effect runs after the component renders and whenever the text content changes.
-    // It tells MathJax to scan the rendered content for math delimiters and typeset them.
-    // This is a robust approach that avoids brittle string replacement.
     useEffect(() => {
-        if (contentRef.current && window.MathJax) {
-            window.MathJax.typesetPromise([contentRef.current]).catch((err: any) =>
+        // After React has rendered the component, we manually trigger MathJax to typeset the math.
+        // We target the specific container element for efficiency, so it only processes this new message.
+        if (window.MathJax && containerRef.current) {
+            window.MathJax.typesetPromise([containerRef.current]).catch((err: any) =>
                 console.error('MathJax typesetting error:', err)
             );
         }
-    }, [text]);
+    }, [text]); // Re-run this effect whenever the text content changes.
 
+    const preprocessLaTeX = (text: string): string => {
+        // This function normalizes various LaTeX delimiter formats from the AI
+        // into the standard format expected by remark-math.
+        return text
+            // Process display math: \\[ ... \\] -> $$ ... $$ on new lines.
+            // Handles both single (\\) and double (\\\\) backslashes from the model.
+            .replace(/\\\\\[([\s\S]*?)\\\\\]/g, '\n$$$1$$\n')
+            .replace(/\\\[([\s\S]*?)\\\]/g, '\n$$$1$$\n')
+            // Process inline math: \( ... \) -> $ ... $
+            .replace(/\\\\\(([\s\S]*?)\\\\\)/g, '$$1$')
+            .replace(/\\\(([\s\S]*?)\\\)/g, '$$1$');
+    };
+    
     const isCodeWizard = (assistants.find(a => a.id === activeChat?.assistantId) || assistants[0]).id === 'code-wizard';
     
     // Counter for code blocks within this specific message part.
     let codeBlockCounter = 0;
 
     return (
-        <div ref={contentRef}>
+        <div ref={containerRef}>
             <ReactMarkdown
-                remarkPlugins={[remarkGfm]}
+                remarkPlugins={[remarkGfm, remarkMath]}
+                rehypePlugins={[rehypeMathjax]}
                 components={{
                     code(props) {
                         const { children, className, node, ...rest } = props;
@@ -1093,7 +1127,7 @@ const App: FC = () => {
                     }
                 }}
             >
-                {text}
+                {preprocessLaTeX(text)}
             </ReactMarkdown>
         </div>
     );
@@ -1180,10 +1214,10 @@ const App: FC = () => {
                 
                     <div className="mode-selector">
                         <select value={currentMode} onChange={handleModeChange}>
-                            <option value="quick" title="Quick: 1x Gemini 2.5 Flash Lite agent for near-instantaneous responses.">Quick</option>
+                            <option value="quick" title="Quick: 1x Gemini 2.5 Flash agent for near-instantaneous, high-quality responses.">Quick</option>
                             <option value="flash" title="Flash: 2x Gemini 2.5 Flash agents (fast) for quick and efficient answers.">Flash</option>
                             <option value="pro" title="Pro: 4x Gemini 2.5 Flash agents for balanced, high-quality responses.">Pro</option>
-                            <option value="heavy" title="Heavy: 4x Gemini 2.5 Pro agents for maximum quality and reasoning.">Heavy</option>
+                            <option value="heavy" title="Heavy: 4x Gemini 2.5 Flash agents with a multi-step reasoning process for maximum quality.">Heavy</option>
                             <option value="image-gen">Image Gen</option>
                         </select>
                     </div>

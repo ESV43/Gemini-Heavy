@@ -1,4 +1,5 @@
 
+
 *, *::before, *::after { box-sizing: border-box; }
 
 :root {
@@ -487,11 +488,14 @@ body {
   cursor: pointer; transition: background-color 0.2s, color 0.2s; flex-shrink: 0;
 }
 .icon-button:hover:not(:disabled) { background-color: var(--bg-tertiary); color: var(--accent-primary); }
-.icon-button:disabled { cursor: not-allowed; color: var(--text-tertiary); }
+.icon-button:disabled { cursor: not-allowed; color: var(--text-tertiary); opacity: 0.6; }
 .icon-button.recording { color: var(--error-color); }
 
 .send-button { background-color: var(--accent-neon); color: var(--accent-primary-dark); }
 .send-button:hover:not(:disabled) { background-color: var(--accent-hover); }
+.send-button:disabled {
+  background-color: var(--bg-tertiary);
+}
 
 .search-toggle {
   display: flex; align-items: center; gap: 0.5rem;

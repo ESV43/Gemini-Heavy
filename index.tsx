@@ -1,5 +1,4 @@
 
-
 import React, { useState, useEffect, useRef, FormEvent, FC, ReactNode, useCallback } from 'react';
 import { createRoot } from 'react-dom/client';
 import { GoogleGenAI, Content, Part, GenerateContentResponse, Chat, Modality, Type } from '@google/genai';
@@ -151,52 +150,91 @@ const DEFAULT_ASSISTANTS: Assistant[] = [
 ];
 
 // --- FILE HELPERS ---
-const processFile = (file: File, onProgress: (progress: number) => void): Promise<Part[]> => {
+const processFile = (file: File, apiKey: string, onProgress: (progress: number) => void): Promise<Part[]> => {
     return new Promise((resolve, reject) => {
-        const reader = new FileReader();
-
-        reader.onprogress = (event) => {
-            if (event.lengthComputable) {
-                const percentLoaded = Math.round((event.loaded / event.total) * 100);
-                onProgress(percentLoaded);
-            }
-        };
-
-        reader.onerror = (error) => reject(new Error(`Failed to read file: ${error}`));
-
+        // Optimization: For small text-based files, embed them directly without uploading.
+        // This is faster and avoids unnecessary API calls.
         const isTextBased = file.type.startsWith('text/') || file.name.endsWith('.txt') || file.name.endsWith('.csv');
-
-        if (isTextBased) {
+        if (isTextBased && file.size < 1024 * 1024) { // 1MB threshold
+            const reader = new FileReader();
             reader.onload = () => {
                 onProgress(100);
                 const textContent = reader.result as string;
                 resolve([{ text: `\n--- Start of file: ${file.name} ---\n${textContent}\n--- End of file: ${file.name} ---\n` }]);
             };
-            reader.readAsText(file);
-        } else { // Handle images, audio, pdf, etc. as inlineData
-            reader.onloadend = () => {
-                onProgress(100);
-                if (typeof reader.result === 'string') {
-                    const resultParts = reader.result.split(',');
-                    if (resultParts.length < 2) {
-                        reject(new Error("Invalid file format."));
-                        return;
-                    }
-                    const filePart = { inlineData: { data: resultParts[1], mimeType: file.type } };
-                    
-                    const needsAnalysisHint = !file.type.startsWith('image/') && !file.type.startsWith('video/') && !file.type.startsWith('audio/');
-                    if (needsAnalysisHint) {
-                        const textPart = { text: `\nThe user attached a file: "${file.name}". Analyze its content to answer the query.` };
-                        resolve([filePart, textPart]);
-                    } else {
-                        resolve([filePart]);
-                    }
-                } else {
-                    reject(new Error("Failed to read file as data URL."));
+            reader.onerror = (error) => reject(new Error(`Failed to read file: ${error}`));
+            reader.onprogress = (event) => {
+                if (event.lengthComputable) {
+                    const percentLoaded = Math.round((event.loaded / event.total) * 100);
+                    onProgress(percentLoaded);
                 }
             };
-            reader.readAsDataURL(file);
+            reader.readAsText(file);
+            return;
         }
+
+        // For large files or binary files, use the Gemini File API to upload them first.
+        // This avoids loading the entire file into browser memory.
+        const xhr = new XMLHttpRequest();
+        // Note: Using v1beta as the File API is often available there first.
+        const uploadUrl = `https://generativelanguage.googleapis.com/v1beta/files?uploadType=media`;
+        
+        xhr.open('POST', uploadUrl, true);
+        xhr.setRequestHeader('Content-Type', file.type);
+        xhr.setRequestHeader('x-goog-api-key', apiKey); // The API key is sent as a header
+
+        xhr.upload.onprogress = (event) => {
+            if (event.lengthComputable) {
+                // We'll cap progress at 99% here, as the final 100% will be set
+                // after the server confirms the upload is complete and processed.
+                const percentLoaded = Math.round((event.loaded / event.total) * 99);
+                onProgress(percentLoaded);
+            }
+        };
+
+        xhr.onload = () => {
+            if (xhr.status === 200) {
+                try {
+                    const response = JSON.parse(xhr.responseText);
+                    if (response.file && response.file.uri) {
+                        onProgress(100);
+                        const filePart = { fileData: { mimeType: file.type, fileUri: response.file.uri } };
+                        
+                        const needsAnalysisHint = !file.type.startsWith('image/') && !file.type.startsWith('video/') && !file.type.startsWith('audio/');
+                        if (needsAnalysisHint) {
+                            const textPart = { text: `\nThe user attached a file: "${file.name}". Analyze its content to answer the query.` };
+                            resolve([filePart, textPart]);
+                        } else {
+                            resolve([filePart]);
+                        }
+                    } else {
+                        // The Gemini API is supposed to return a `file` object. If not, it's an error.
+                        reject(new Error("File API response is malformed. Missing 'file' object or 'uri'."));
+                    }
+                } catch (e) {
+                    reject(new Error(`Failed to parse File API response: ${e instanceof Error ? e.message : String(e)}`));
+                }
+            } else {
+                // Attempt to parse a more helpful error message from the response.
+                let errorMessage = xhr.responseText;
+                try {
+                    const errorResponse = JSON.parse(xhr.responseText);
+                    if (errorResponse.error && errorResponse.error.message) {
+                        errorMessage = errorResponse.error.message;
+                    }
+                } catch (e) {
+                    // Response was not JSON, use the raw text.
+                }
+                reject(new Error(`File upload failed with status ${xhr.status}: ${errorMessage}`));
+            }
+        };
+        
+        xhr.onerror = () => {
+            reject(new Error('A network error occurred during the file upload.'));
+        };
+
+        // Start the upload
+        xhr.send(file);
     });
 };
 
@@ -472,7 +510,15 @@ const App: FC = () => {
     setAttachments(prev => [...prev, ...newAttachments]);
 
     newAttachments.forEach(att => {
-      processFile(att.file, (progress) => {
+      if (!apiKey) {
+        setAttachments(prev => prev.map(a => 
+          a.id === att.id ? { ...a, status: 'error', errorMessage: 'API Key is missing. Cannot upload file.', progress: 0 } : a
+        ));
+        setIsApiKeyModalOpen(true);
+        return;
+      }
+
+      processFile(att.file, apiKey, (progress) => {
         setAttachments(prev => prev.map(a => 
           a.id === att.id ? { ...a, progress } : a
         ));
@@ -898,7 +944,7 @@ const App: FC = () => {
           addFilesToAttachments(Array.from(e.dataTransfer.files));
           e.dataTransfer.clearData();
       }
-  }, [isLoading]);
+  }, [isLoading, apiKey]); // Add apiKey dependency
 
   const handleRunCode = async (language: string, code: string, messageId: string, blockIndex: number) => {
     const key = `${messageId}-${blockIndex}`;
@@ -1052,6 +1098,8 @@ const App: FC = () => {
         return <img key={partIndex} src={`data:${mimeType};base64,${data}`} alt="Generated content" className="generated-image" />;
       }
     }
+    // fileData parts are not rendered directly in the message bubble,
+    // they are just references for the model.
     return null;
   };
 
